@@ -1,0 +1,76 @@
+{
+  "records": [
+    {
+      "timestamp": 1790625011,
+      "category": "Text",
+      "original_size_bytes": 529252,
+      "compressed_size_bytes": 3,
+      "duration_ms": 7,
+      "format": "Zstd",
+      "level": "Maximum",
+      "ratio_percent": 0.0005668377256958878,
+      "speed_mb_s": 72.10486275809151,
+      "algorithm": "Zstd"
+    },
+    {
+      "timestamp": 1790626982,
+      "category": "Text",
+      "original_size_bytes": 618519,
+      "compressed_size_bytes": 618519,
+      "duration_ms": 44,
+      "format": "Zstd",
+      "level": "Maximum",
+      "ratio_percent": 100.0,
+      "speed_mb_s": 13.406038284301758,
+      "algorithm": "Zstd"
+    },
+    {
+      "timestamp": 1790627009,
+      "category": "Text",
+      "original_size_bytes": 484746,
+      "compressed_size_bytes": 484746,
+      "duration_ms": 1591,
+      "format": "Zstd",
+      "level": "Maximum",
+      "ratio_percent": 100.0,
+      "speed_mb_s": 0.29056556265283723,
+      "algorithm": "Zstd"
+    },
+    {
+      "timestamp": 1790627030,
+      "category": "Text",
+      "original_size_bytes": 618519,
+      "compressed_size_bytes": 618519,
+      "duration_ms": 26,
+      "format": "Gzip",
+      "level": "Maximum",
+      "ratio_percent": 100.0,
+      "speed_mb_s": 22.687141711895283,
+      "algorithm": "Gzip"
+    },
+    {
+      "timestamp": 1790627057,
+      "category": "Text",
+      "original_size_bytes": 618519,
+      "compressed_size_bytes": 618519,
+      "duration_ms": 1844,
+      "format": "SevenZ",
+      "level": "Maximum",
+      "ratio_percent": 100.0,
+      "speed_mb_s": 0.3198837768488489,
+      "algorithm": "SevenZ"
+    },
+    {
+      "timestamp": 1792699020,
+      "category": "Text",
+      "original_size_bytes": 334145,
+      "compressed_size_bytes": 334145,
+      "duration_ms": 63,
+      "format": "SevenZ",
+      "level": "Maximum",
+      "ratio_percent": 100.0,
+      "speed_mb_s": 5.058182610405816,
+      "algorithm": "SevenZ"
+    }
+  ]
+}
