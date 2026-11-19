@@ -98,7 +98,7 @@ pub fn compress(
 fn compress_zip(
     files: &[PathBuf],
     dest: &Path,
-    _level: CompressionLevel,
+    level: CompressionLevel,
     tx: &mpsc::Sender<ProgressUpdate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (items, total_bytes) = collect_files(files)?;
@@ -106,15 +106,23 @@ fn compress_zip(
     let writer = BufWriter::new(out_file);
     let mut zip = zip::ZipWriter::new(writer);
 
-    // Utilisation de FileOptions au lieu de SimpleFileOptions
-    let options = zip::write::FileOptions::default()
-        .compression_method(zip::CompressionMethod::Deflated);
+    // Le niveau choisi dans l'interface est maintenant appliqué (Deflate 1 / 6 / 9).
+    let zip_level = match level {
+        CompressionLevel::Fast => 1,
+        CompressionLevel::Default => 6,
+        CompressionLevel::Maximum => 9,
+    };
+    let base_options = zip::write::FileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .compression_level(Some(zip_level));
 
     let mut processed_bytes = 0u64;
     let mut buffer = vec![0u8; 64 * 1024];
 
     for item in &items {
         let name_str = item.relative_path.to_string_lossy().replace('\\', "/");
+        // Les fichiers de 4 Gio ou plus exigent l'extension Zip64.
+        let options = base_options.large_file(item.size >= 0xFFFF_FFFF);
         zip.start_file(name_str.clone(), options)?;
 
         let mut f = File::open(&item.full_path)?;
@@ -159,13 +167,22 @@ fn compress_7z(
     _level: CompressionLevel,
     tx: &mpsc::Sender<ProgressUpdate>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (_, total_bytes) = collect_files(files)?;
+    let (items, total_bytes) = collect_files(files)?;
 
     if files.len() == 1 {
         sevenz_rust::compress_to_path(&files[0], dest)?;
     } else {
-        let parent = files[0].parent().unwrap_or(&files[0]);
-        sevenz_rust::compress_to_path(parent, dest)?;
+        // Sélection multiple : on copie uniquement les éléments choisis dans un dossier temporaire.
+        // (Avant, tout le dossier parent était archivé, y compris les fichiers non sélectionnés.)
+        let tmp = tempfile::tempdir()?;
+        for item in &items {
+            let target = tmp.path().join(&item.relative_path);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&item.full_path, &target)?;
+        }
+        sevenz_rust::compress_to_path(tmp.path(), dest)?;
     }
 
     let _ = tx.blocking_send(ProgressUpdate {

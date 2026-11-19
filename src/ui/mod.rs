@@ -6,7 +6,8 @@ use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 // Color palette derived from the FLX Archiver logo (Mauve & Slate Gray)
@@ -71,13 +72,16 @@ pub struct FlxApp {
     learning_engine: LearningEngine,
     rt: tokio::runtime::Handle,
     error_msg: String,
+    error_slot: Arc<Mutex<Option<String>>>,
+    is_compression: bool,
+    last_dest: Option<PathBuf>,
 }
 
 impl FlxApp {
     pub fn new(cc: &eframe::CreationContext<'_>, rt: tokio::runtime::Handle) -> Self {
         Self::configure_theme(&cc.egui_ctx);
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        let learning_engine = LearningEngine::new("benchmark_history.json");
+        let learning_engine = LearningEngine::new(crate::config::history_path());
 
         Self {
             active_tab: Tab::Archive,
@@ -96,6 +100,9 @@ impl FlxApp {
                 percentage: 0.0,
             },
             error_msg: String::new(),
+            error_slot: Arc::new(Mutex::new(None)),
+            is_compression: false,
+            last_dest: None,
             start_time: None,
             progress_rx: None,
             learning_engine,
@@ -141,14 +148,16 @@ impl FlxApp {
         self.start_time = Some(Instant::now());
         self.error_msg.clear();
 
-        self.rt.spawn(async move {
-            let res = tokio::task::spawn_blocking(move || {
-                decompress(archive, dest, tx)
-            })
-            .await;
+        self.is_compression = false;
+        self.last_dest = None;
+        *self.error_slot.lock().unwrap() = None;
+        let slot = self.error_slot.clone();
 
-            if let Err(e) = res {
-                eprintln!("Extraction error: {:?}", e);
+        // `decompress` est une fonction async : il faut l'attendre. Avant, le futur était créé puis jeté
+        // sans être exécuté, donc l'extraction ne démarrait jamais.
+        self.rt.spawn(async move {
+            if let Err(e) = decompress(archive, dest, tx).await {
+                *slot.lock().unwrap() = Some(e.to_string());
             }
         });
     }
@@ -189,20 +198,49 @@ impl FlxApp {
         let format = self.selected_format;
         let level = self.selected_level;
 
-        self.rt.spawn(async move {
-            let res = tokio::task::spawn_blocking(move || {
-                compress(files, dest, format, level, tx)
-            })
-            .await;
+        self.is_compression = true;
+        self.last_dest = Some(dest.clone());
+        *self.error_slot.lock().unwrap() = None;
+        let slot = self.error_slot.clone();
 
-            if let Err(e) = res {
-                eprintln!("Compression error: {:?}", e);
+        self.rt.spawn(async move {
+            let res = tokio::task::spawn_blocking(move || compress(files, dest, format, level, tx)).await;
+            let error = match res {
+                Ok(Ok(())) => None,
+                Ok(Err(e)) => Some(e.to_string()),
+                Err(e) => Some(format!("Tâche interrompue : {e}")),
+            };
+            if error.is_some() {
+                *slot.lock().unwrap() = error;
             }
         });
     }
 
+    fn finish_success(&mut self) {
+        self.progress.percentage = 100.0;
+        // On n'enregistre une mesure que pour une compression, avec la vraie taille du fichier produit
+        // (avant : la taille d'origine était enregistrée comme taille compressée, ce qui faussait l'historique).
+        if self.is_compression {
+            if let (Some(profile), Some(start), Some(dest)) = (&self.profile, self.start_time, &self.last_dest) {
+                let compressed = fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
+                if compressed > 0 {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    self.learning_engine.record_result(
+                        profile,
+                        self.selected_format,
+                        self.selected_level,
+                        profile.total_size,
+                        compressed,
+                        duration_ms,
+                    );
+                }
+            }
+        }
+        self.view_state = ViewState::Finished;
+    }
+
     fn load_history(&self) -> Vec<BenchmarkRecordEntry> {
-        if let Ok(content) = fs::read_to_string("benchmark_history.json") {
+        if let Ok(content) = fs::read_to_string(crate::config::history_path()) {
             #[derive(Deserialize)]
             struct HistoryFile {
                 #[serde(default)]
@@ -220,42 +258,38 @@ impl FlxApp {
 
 impl eframe::App for FlxApp {
     fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        let mut disconnected = false;
         if let Some(rx) = &mut self.progress_rx {
             loop {
                 match rx.try_recv() {
                     Ok(update) => {
                         self.progress = update;
                         ctx.request_repaint();
-
-                        if self.progress.percentage >= 100.0 {
-                            if let (Some(profile), Some(start)) = (&self.profile, self.start_time) {
-                                let duration_ms = start.elapsed().as_millis() as u64;
-                                self.learning_engine.record_result(
-                                    profile,
-                                    self.selected_format,
-                                    self.selected_level,
-                                    profile.total_size,
-                                    self.progress.bytes_processed,
-                                    duration_ms,
-                                );
-                            }
-                            self.view_state = ViewState::Finished;
-                        }
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
-                        if self.view_state == ViewState::Progress {
-                            if self.progress.percentage < 100.0 {
-                                self.error_msg = "File processing failed.".to_string();
-                                self.view_state = ViewState::Error;
-                            } else {
-                                self.view_state = ViewState::Finished;
-                            }
-                        }
-                        self.progress_rx = None;
+                        disconnected = true;
                         break;
                     }
                 }
+            }
+            if disconnected {
+                self.progress_rx = None;
+            } else {
+                // Pas de nouveau message : on revient vérifier rapidement si l'opération s'est terminée.
+                ctx.request_repaint_after(Duration::from_millis(100));
+            }
+        }
+
+        // L'opération est terminée quand le canal se ferme : succès, sauf si une erreur a été déposée.
+        if disconnected && self.view_state == ViewState::Progress {
+            let error = self.error_slot.lock().unwrap().take();
+            match error {
+                Some(msg) => {
+                    self.error_msg = msg;
+                    self.view_state = ViewState::Error;
+                }
+                None => self.finish_success(),
             }
         }
 
@@ -297,7 +331,7 @@ impl eframe::App for FlxApp {
                     self.active_tab = Tab::Explorer;
                 }
                 ui.add_space(8.0);
-                if nav_item(ui, "Benchmark & Data", Tab::Benchmark, self.active_tab) {
+                if nav_item(ui, "Statistics", Tab::Benchmark, self.active_tab) {
                     self.active_tab = Tab::Benchmark;
                 }
                 ui.add_space(8.0);
@@ -433,7 +467,7 @@ impl FlxApp {
                                 .fill(COLOR_CARD)
                                 .inner_margin(Margin::same(10.0))
                                 .show(ui, |ui| {
-                                    ui.label(RichText::new("AI / Benchmark Recommendation:").strong().color(COLOR_ACCENT));
+                                    ui.label(RichText::new("Recommendation:").strong().color(COLOR_ACCENT));
                                     ui.label(&rec.reason);
                                 });
                             ui.add_space(15.0);
@@ -592,7 +626,7 @@ impl FlxApp {
     }
 
     fn show_benchmark_tab(&mut self, ui: &mut egui::Ui) {
-        ui.heading(RichText::new("Benchmark & Performance Dashboard").size(20.0).strong());
+        ui.heading(RichText::new("Statistics & Performance").size(20.0).strong());
         ui.add_space(15.0);
 
         let records = self.load_history();

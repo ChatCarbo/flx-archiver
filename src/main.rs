@@ -1,7 +1,9 @@
 #![windows_subsystem = "windows"]
 mod benchmark;
 mod compression;
+mod config;
 mod decompression;
+mod security;
 mod ui;
 
 use ui::FlxApp;

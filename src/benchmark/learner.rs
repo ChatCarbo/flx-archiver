@@ -40,6 +40,9 @@ pub struct Recommendation {
     pub reason: String,
 }
 
+/// Nombre minimal de mesures d'une catégorie avant de s'appuyer sur l'historique.
+const MIN_RECORDS: usize = 3;
+
 pub struct LearningEngine {
     history: BenchmarkHistory,
     history_path: PathBuf,
@@ -57,34 +60,56 @@ impl LearningEngine {
 
     pub fn recommend<C: IntoCategory>(&self, target: C) -> Recommendation {
         let category = target.into_category();
+        // On ignore les mesures sans valeur : compressé == original provient d'une ancienne version
+        // qui enregistrait la taille d'origine comme taille compressée.
         let matching_records: Vec<&BenchmarkRecord> = self
             .history
             .records
             .iter()
-            .filter(|r| r.category == category)
+            .filter(|r| {
+                r.category == category
+                    && r.original_size_bytes > 0
+                    && r.compressed_size_bytes > 0
+                    && r.compressed_size_bytes != r.original_size_bytes
+            })
             .collect();
 
-        if matching_records.is_empty() {
+        // Pas assez de mesures : les règles par défaut sont plus fiables qu'un seul essai.
+        if matching_records.len() < MIN_RECORDS {
             return self.default_recommendation(category);
         }
 
-        let mut best_record = matching_records[0];
-        let mut best_score = -1.0f64;
-
+        // Moyenne par couple (format, niveau), pour qu'une mesure isolée ne décide pas seule.
+        let mut groups: Vec<(String, String, Vec<&BenchmarkRecord>)> = Vec::new();
         for record in matching_records {
-            let score = (100.0 - record.ratio_percent) * 0.6 + (record.speed_mb_s * 0.4);
-            if score > best_score {
-                best_score = score;
-                best_record = record;
+            match groups
+                .iter_mut()
+                .find(|(f, l, _)| *f == record.format && *l == record.level)
+            {
+                Some((_, _, list)) => list.push(record),
+                None => groups.push((record.format.clone(), record.level.clone(), vec![record])),
             }
         }
 
+        let mut best: Option<(f64, String, String, f64, f64)> = None;
+        for (format, level, list) in &groups {
+            let n = list.len() as f64;
+            let ratio = list.iter().map(|r| r.ratio_percent).sum::<f64>() / n;
+            let speed = list.iter().map(|r| r.speed_mb_s).sum::<f64>() / n;
+            // La vitesse est plafonnée à 200 MB/s pour ne pas écraser le critère de taille.
+            let score = (100.0 - ratio).max(0.0) * 0.6 + (speed.min(200.0) / 200.0 * 100.0) * 0.4;
+            if best.as_ref().map_or(true, |b| score > b.0) {
+                best = Some((score, format.clone(), level.clone(), ratio, speed));
+            }
+        }
+
+        let (_, format, level, ratio, speed) = best.expect("au moins un groupe");
         Recommendation {
-            format: parse_format(&best_record.format),
-            level: parse_level(&best_record.level),
+            format: parse_format(&format),
+            level: parse_level(&level),
             reason: format!(
                 "Recommendation based on history ({:.1}% ratio, {:.1} MB/s)",
-                best_record.ratio_percent, best_record.speed_mb_s
+                ratio, speed
             ),
         }
     }
@@ -101,7 +126,7 @@ impl LearningEngine {
                 level: CompressionLevel::Maximum,
                 reason: "Text/code files: excellent compressibility with Zstd".to_string(),
             },
-            FileCategory::BinaryExec | FileCategory::Binary | FileCategory::Mixed => Recommendation {
+            FileCategory::BinaryExec | FileCategory::Binary | FileCategory::Mixed | FileCategory::Media => Recommendation {
                 format: ArchiveFormat::Zstd,
                 level: CompressionLevel::Default,
                 reason: "Binary/mixed files: good speed/ratio trade-off".to_string(),
